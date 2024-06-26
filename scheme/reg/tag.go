@@ -309,6 +309,130 @@ func (reg *Reg) tagListOCI(ctx context.Context, r ref.Ref, config scheme.TagConf
 	return tl, nil
 }
 
+func (reg *Reg) TagDirectCoverDelete(ctx context.Context, r ref.Ref) error {
+	var tempManifest manifest.Manifest
+	if r.Tag == "" {
+		return errs.ErrMissingTag
+	}
+	// Note, this should be MediaType specific, but it appears that docker uses OCI for the config
+	now := time.Now()
+	conf := v1.Image{
+		Created: &now,
+		Config: v1.ImageConfig{
+			Labels: map[string]string{
+				"delete-tag":  r.Tag,
+				"delete-date": now.String(),
+			},
+		},
+		Platform: platform.Platform{
+			OS:           "linux",
+			Architecture: "amd64",
+		},
+		History: []v1.History{
+			{
+				Created:   &now,
+				CreatedBy: "# regclient",
+				Comment:   "empty JSON blob",
+			},
+		},
+		RootFS: v1.RootFS{
+			Type: "layers",
+			DiffIDs: []digest.Digest{
+				descriptor.EmptyDigest,
+			},
+		},
+	}
+	confB, err := json.Marshal(conf)
+	if err != nil {
+		return err
+	}
+	digester := digest.Canonical.Digester()
+	confBuf := bytes.NewBuffer(confB)
+	_, err = confBuf.WriteTo(digester.Hash())
+	if err != nil {
+		return err
+	}
+	confDigest := digester.Digest()
+
+	// create manifest with config, matching the original tag manifest type
+	switch manifest.GetMediaType(curManifest) {
+	case mediatype.OCI1Manifest, mediatype.OCI1ManifestList:
+		tempManifest, err = manifest.New(manifest.WithOrig(v1.Manifest{
+			Versioned: v1.ManifestSchemaVersion,
+			MediaType: mediatype.OCI1Manifest,
+			Config: descriptor.Descriptor{
+				MediaType: mediatype.OCI1ImageConfig,
+				Digest:    confDigest,
+				Size:      int64(len(confB)),
+			},
+			Layers: []descriptor.Descriptor{
+				{
+					MediaType: mediatype.OCI1Layer,
+					Size:      int64(len(descriptor.EmptyData)),
+					Digest:    descriptor.EmptyDigest,
+				},
+			},
+		}))
+		if err != nil {
+			return err
+		}
+	default: // default to the docker v2 schema
+		tempManifest, err = manifest.New(manifest.WithOrig(schema2.Manifest{
+			Versioned: schema2.ManifestSchemaVersion,
+			Config: descriptor.Descriptor{
+				MediaType: mediatype.Docker2ImageConfig,
+				Digest:    confDigest,
+				Size:      int64(len(confB)),
+			},
+			Layers: []descriptor.Descriptor{
+				{
+					MediaType: mediatype.Docker2LayerGzip,
+					Size:      int64(len(descriptor.EmptyData)),
+					Digest:    descriptor.EmptyDigest,
+				},
+			},
+		}))
+		if err != nil {
+			return err
+		}
+	}
+	reg.log.WithFields(logrus.Fields{
+		"ref": r.Reference,
+	}).Debug("Sending dummy manifest to replace tag")
+
+	// push empty layer
+	_, err = reg.BlobPut(ctx, r, descriptor.Descriptor{Digest: descriptor.EmptyDigest, Size: int64(len(descriptor.EmptyData))}, bytes.NewReader(descriptor.EmptyData))
+	if err != nil {
+		return err
+	}
+
+	// push config
+	_, err = reg.BlobPut(ctx, r, descriptor.Descriptor{Digest: confDigest, Size: int64(len(confB))}, bytes.NewReader(confB))
+	if err != nil {
+		return fmt.Errorf("failed sending dummy config to delete %s: %w", r.CommonName(), err)
+	}
+
+	// push manifest to tag
+	err = reg.ManifestPut(ctx, r, tempManifest)
+	if err != nil {
+		return fmt.Errorf("failed sending dummy manifest to delete %s: %w", r.CommonName(), err)
+	}
+
+	r.Digest = tempManifest.GetDescriptor().Digest.String()
+
+	// delete manifest by digest
+	reg.log.WithFields(logrus.Fields{
+		"ref":    r.Reference,
+		"digest": r.Digest,
+	}).Debug("Deleting dummy manifest")
+	err = reg.ManifestDelete(ctx, r)
+	if err != nil {
+		return fmt.Errorf("failed deleting dummy manifest for %s: %w", r.CommonName(), err)
+	}
+
+	return nil
+}
+
 func (reg *Reg) tagListLink(ctx context.Context, r ref.Ref, _ scheme.TagConfig, link *url.URL) (*tag.List, error) {
 	headers := http.Header{
 		"Accept": []string{"application/json"},
